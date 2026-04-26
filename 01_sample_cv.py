@@ -1,79 +1,68 @@
 import pandas as pd
-import requests
-import xml.etree.ElementTree as ET
-import time
 from tqdm import tqdm
 
 TARGET_CATEGORIES = {"cs.CV", "cs.AI"}
-ARXIV_NS = "http://arxiv.org/schemas/atom"
-ARXIV_META_NS = "http://arxiv.org/schemas/atom"
+
+# Path to the Kaggle ArXiv metadata snapshot
+# Download from: https://www.kaggle.com/datasets/Cornell-University/arxiv
+KAGGLE_SNAPSHOT = "./arxiv-metadata-oai-snapshot.json"
 
 
-def get_primary_category(doi: str) -> str | None:
+def load_kaggle_category_map(snapshot_path: str) -> dict[str, str]:
     """
-    Query the ArXiv API for a given DOI/ID and return the primary category term.
-    Returns None if the request fails or the category cannot be parsed.
+    Stream the Kaggle snapshot JSON (one record per line) and build a
+    doi -> primary_category dict. Primary category is the first token
+    in the space-separated 'categories' field.
     """
-    url = f"http://export.arxiv.org/api/query?id_list={doi}"
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-    except requests.RequestException:
-        return None
-
-    try:
-        root = ET.fromstring(resp.text)
-        # Namespace map used by ArXiv Atom feed
-        ns = {
-            "atom": "http://www.w3.org/2005/Atom",
-            "arxiv": "http://arxiv.org/schemas/atom",
-        }
-        entry = root.find("atom:entry", ns)
-        if entry is None:
-            return None
-        cat_el = entry.find("arxiv:primary_category", ns)
-        if cat_el is None:
-            # Fall back to the standard Atom category element
-            cat_el = entry.find("atom:category", ns)
-        if cat_el is not None:
-            return cat_el.get("term")
-    except ET.ParseError:
-        return None
-
-    return None
-
-
-def is_target_category(doi: str) -> bool:
-    category = get_primary_category(doi)
-    print(f"DOI: {doi}, Category: {category}")
-    return category in TARGET_CATEGORIES
+    print(f"Loading Kaggle snapshot: {snapshot_path}")
+    cat_map = {}
+    with tqdm(desc="Reading snapshot") as pbar:
+        for chunk in pd.read_json(snapshot_path, lines=True, chunksize=50_000):
+            for _, row in chunk.iterrows():
+                doi = str(row["id"]).strip()
+                cats = str(row.get("categories", "")).strip()
+                primary = cats.split()[0] if cats else None
+                cat_map[doi] = primary
+            pbar.update(len(chunk))
+    print(f"Snapshot loaded: {len(cat_map):,} papers indexed")
+    return cat_map
 
 
 def main():
+    cat_map = load_kaggle_category_map(KAGGLE_SNAPSHOT)
+
     print("Loading parquet dataset...")
     df = pd.read_parquet("./hf_data/")
     print(f"Total rows: {len(df):,}")
 
-    # Shuffle with a fixed seed so results are reproducible
     df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
     collected = []
-    checked = 0
+    skipped_no_meta = 0
 
     print(f"Filtering for categories: {TARGET_CATEGORIES}")
-    print("Querying ArXiv API (rate-limited to ~3 req/s)...")
 
     for _, row in tqdm(df.iterrows(), total=len(df)):
         doi = str(row["DOI"]).strip()
-        if is_target_category(doi):
+
+        category = cat_map.get(doi)  # None if not in Kaggle snapshot — skip
+
+        if category is None:
+            skipped_no_meta += 1
+            continue
+
+        if category in TARGET_CATEGORIES:
             collected.append(row)
             if len(collected) >= 50_000:
                 break
-        checked += 1
-        # ArXiv asks for no more than 3 requests/second
-        time.sleep(0.34)
 
-    print(f"\nChecked {checked:,} papers, kept {len(collected):,}")
+    total_checked = len(collected) + skipped_no_meta + (
+        # rows iterated that weren't in target and weren't skipped
+        sum(1 for _ in [])  # placeholder; tqdm handles display
+    )
+
+    print(f"\nSkipped (not in Kaggle snapshot): {skipped_no_meta:,}")
+    print(f"Collected: {len(collected):,}")
 
     result_df = pd.DataFrame(collected)
     out_path = "sample_cv.parquet"
