@@ -10,6 +10,8 @@ Pipeline:
   2. Filter Voronoi vertices: must be inside alpha-shape hull
   3. Score each vertex by distance to nearest real paper
      (Voronoi vertices ARE the centres of maximal empty circles — no KDE needed)
+  3b. Filter by angular coverage: discard edge bays / peninsulas where border
+      papers don't surround the candidate from all sides
   4. Deduplicate: suppress vertices too close to a higher-ranked one
   5. Pick top N → void centres
   6. Per void: find K nearest real papers → border papers
@@ -21,6 +23,16 @@ Why Voronoi instead of KDE grid:
   is the centre of the largest empty circle that fits between its neighbours.
   This is the exact answer to "where are the holes?" with no grid resolution
   or bandwidth hyperparameters, and no edge bias from density estimation.
+
+Why angular coverage filtering:
+  The alpha-shape hull clips the outer boundary of the data, but within that
+  hull there can be long thin peninsulas or concave bays where the hull still
+  "covers" a huge stretch of empty space that's really just open edge, not a
+  true interior gap. A coastal bay has all its border papers clustered on one
+  arc (~180°), with the other half pointing into empty space. A real interior
+  void has papers surrounding it from all directions. The angular coverage
+  filter directly measures the largest angular gap between consecutive border
+  papers around each candidate — large gap = edge artifact, discard it.
 
 LLM backend : HackClub AI proxy via openrouter
   server_url : https://ai.hackclub.com/proxy/v1
@@ -63,7 +75,6 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from joblib import Parallel, delayed
-# from openrouter import OpenRouter
 from shapely.geometry import MultiPoint, Point
 from sklearn.neighbors import NearestNeighbors
 from scipy.spatial import Voronoi
@@ -91,6 +102,16 @@ DEDUP_RADIUS = 1.0
 # Border papers per void
 BORDER_K = 10
 
+# Angular coverage filter
+# How many neighbors to use when computing angular spread around each candidate.
+# More neighbors = more robust estimate, but slower.
+ANGULAR_K = 20
+# Require that border papers cover at least this many degrees around the candidate.
+# Equivalently: the largest angular gap between consecutive neighbors must be
+# no more than (360 - MIN_COVERAGE_DEG). Set lower (e.g. 260) if you find
+# real interior voids near elongated clusters are being incorrectly discarded.
+MIN_COVERAGE_DEG = 300  # allows at most a 60° open wedge
+
 # Parallelism
 N_JOBS = -1
 
@@ -99,67 +120,12 @@ DO_LLM_NAMING = False
 LLM_DELAY     = 0.5
 
 # ---------------------------------------------------------------------------
-# HackClub client — commented out while LLM naming is disabled
-# ---------------------------------------------------------------------------
-# HACKCLUB_KEY = os.getenv("HACKCLUB_KEY")
-# if DO_LLM_NAMING and not HACKCLUB_KEY:
-#     raise EnvironmentError("HACKCLUB_KEY not set — add it to your .env file")
-#
-# ai_client = OpenRouter(
-#     api_key=HACKCLUB_KEY or "dummy",
-#     server_url="https://ai.hackclub.com/proxy/v1",
-# )
-
-# ---------------------------------------------------------------------------
 # LLM: name a void given its border paper titles
 # ---------------------------------------------------------------------------
-# _SYSTEM_PROMPT = (
-#     "You are a research cartographer mapping the landscape of scientific literature. "
-#     "You will receive a list of paper titles that SURROUND an empty region in a 2D "
-#     "semantic embedding space. Your task is to name the research topic that is "
-#     "conspicuously ABSENT — the intellectual gap this void represents.\n\n"
-#     "Guidelines:\n"
-#     "- The border papers are the EDGES of the hole, not the hole itself.\n"
-#     "- The void is what would CONNECT or BRIDGE these surrounding topics but doesn't exist yet.\n"
-#     "- Be specific. 'Interdisciplinary research' is not a useful answer.\n"
-#     "- The name should read like a real research field or open problem (3-8 words).\n\n"
-#     "Respond with ONLY valid JSON, no markdown fences:\n"
-#     '{"name": "<short noun phrase>", "reasoning": "<1-2 sentences>"}'
-# )
-
 def name_void(border_titles: list, void_id: int) -> dict:
     """Call the LLM and return {"name": ..., "reasoning": ...}."""
     # --- LLM naming disabled: return placeholder ---
     return {"name": f"Void {void_id}", "reasoning": ""}
-
-    # try:
-    #     titles_block = "\n".join(f"- {t}" for t in border_titles)
-    #     user_msg = (
-    #         f"These papers surround Void #{void_id} in the embedding space:\n\n"
-    #         f"{titles_block}\n\n"
-    #         f"What research topic is conspicuously absent in the gap between them?"
-    #     )
-    #     response = ai_client.chat.send(
-    #         model="openai/gpt-oss-120b",
-    #         messages=[
-    #             {"role": "system", "content": _SYSTEM_PROMPT},
-    #             {"role": "user",   "content": user_msg},
-    #         ],
-    #     )
-    #     raw = response.choices[0].message.content.strip()
-    #     if raw.startswith("```"):
-    #         raw = raw.split("```")[1]
-    #         if raw.startswith("json"):
-    #             raw = raw[4:]
-    #     raw = raw.strip()
-    #     parsed = json.loads(raw)
-    #     return {
-    #         "name":      str(parsed.get("name", f"Void {void_id}")),
-    #         "reasoning": str(parsed.get("reasoning", "")),
-    #     }
-    # except Exception as e:
-    #     print(f"  Warning: naming failed for void {void_id}: {e}")
-    #     return {"name": f"Unnamed Void {void_id}", "reasoning": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +158,30 @@ def compute_void_shape(border_xy: np.ndarray) -> tuple:
         {"type": "convex_hull", "vertices": [[float(x), float(y)] for x, y in coords]},
         float(area),
     )
+
+
+# ---------------------------------------------------------------------------
+# Angular coverage helper
+# ---------------------------------------------------------------------------
+def is_surrounded(centre: np.ndarray, neighbor_xy: np.ndarray, min_arc_deg: float) -> bool:
+    """
+    Return True if neighbor_xy surrounds centre with no single angular gap
+    larger than (360 - min_arc_deg) degrees.
+
+    A candidate on the edge of the data cloud (a coastal bay) will have all
+    its neighbors clustered on one side, leaving a huge gap pointing outward —
+    this function returns False for it.  A genuine interior void will have
+    neighbors spread around it and return True.
+    """
+    angles = np.degrees(np.arctan2(
+        neighbor_xy[:, 1] - centre[1],
+        neighbor_xy[:, 0] - centre[0],
+    ))
+    angles = np.sort(angles % 360)
+    # Gaps between consecutive neighbor angles, wrapping around 360→0
+    gaps = np.diff(np.append(angles, angles[0] + 360))
+    largest_gap = gaps.max()
+    return largest_gap <= (360.0 - min_arc_deg)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +258,42 @@ print(f"  radius ∈ [{empty_radii.min():.4f}, {empty_radii.max():.4f}]  ({time.
 order       = np.argsort(-empty_radii)
 candidates  = candidates[order]
 empty_radii = empty_radii[order]
+
+# ---------------------------------------------------------------------------
+# Step 3b: Filter by angular coverage
+#
+# Discard candidates whose ANGULAR_K nearest papers don't surround them on
+# all sides. Edge bays / peninsulas fail this because their neighbors exist
+# on only ~half the circle, leaving a giant open-wedge pointing outward.
+#
+# Tune MIN_COVERAGE_DEG:
+#   300° → strict, at most a 60° open wedge allowed (default, good start)
+#   270° → looser, allows a 90° gap (use if real voids near filaments are lost)
+#   260° → even looser
+# ---------------------------------------------------------------------------
+print(f"\nFiltering by angular coverage "
+      f"(k={ANGULAR_K}, min_coverage={MIN_COVERAGE_DEG}°, "
+      f"max_gap={360-MIN_COVERAGE_DEG}°) ...")
+t0 = time.time()
+
+angular_nbrs = NearestNeighbors(n_neighbors=ANGULAR_K, n_jobs=N_JOBS).fit(xy)
+_, angular_idxs = angular_nbrs.kneighbors(candidates)
+
+surrounded_mask = np.array([
+    is_surrounded(c, xy[idxs], MIN_COVERAGE_DEG)
+    for c, idxs in zip(candidates, angular_idxs)
+])
+
+n_before = len(candidates)
+candidates  = candidates[surrounded_mask]
+empty_radii = empty_radii[surrounded_mask]
+print(f"  {surrounded_mask.sum():,} / {n_before:,} candidates passed  ({time.time()-t0:.1f}s)")
+
+if len(candidates) == 0:
+    raise RuntimeError(
+        "No candidates survived the angular coverage filter. "
+        f"Lower MIN_COVERAGE_DEG (currently {MIN_COVERAGE_DEG}) — try 270 or 260."
+    )
 
 # ---------------------------------------------------------------------------
 # Step 4: Deduplicate — greedy suppression within DEDUP_RADIUS
