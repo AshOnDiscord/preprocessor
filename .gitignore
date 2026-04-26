@@ -1,0 +1,4 @@
+.venv
+.env
+voids.json
+**/*.parquet
