@@ -35,7 +35,7 @@ INPUT         = "sample_200k.parquet"
 OUTPUT        = "umap_200k.parquet"
 LABELS_OUTPUT = "cluster_labels.json"
 USE_GPU       = False
-LLM_DELAY     = 2.0  # seconds between LLM calls to avoid rate limiting
+LLM_DELAY     = .5  # seconds between LLM calls to avoid rate limiting
 
 HACKCLUB_KEY = os.getenv("HACKCLUB_KEY")
 if not HACKCLUB_KEY:
