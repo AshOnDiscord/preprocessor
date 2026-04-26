@@ -31,40 +31,43 @@ def load_kaggle_category_map(snapshot_path: str) -> dict[str, str]:
 def main():
     cat_map = load_kaggle_category_map(KAGGLE_SNAPSHOT)
 
-    print("Loading parquet dataset...")
-    df = pd.read_parquet("./hf_data/")
-    print(f"Total rows: {len(df):,}")
+    # --- Pass 1: load DOI column only to find matching indices ---
+    print("\nPass 1: loading DOI column only...")
+    dois = pd.read_parquet("./hf_data/", columns=["DOI"])
+    print(f"Total rows: {len(dois):,}")
 
-    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    # Shuffle with fixed seed
+    dois = dois.sample(frac=1, random_state=42)
 
-    collected = []
+    matched_indices = []
     skipped_no_meta = 0
 
     print(f"Filtering for categories: {TARGET_CATEGORIES}")
-
-    for _, row in tqdm(df.iterrows(), total=len(df)):
+    for idx, row in tqdm(dois.iterrows(), total=len(dois)):
         doi = str(row["DOI"]).strip()
-
-        category = cat_map.get(doi)  # None if not in Kaggle snapshot — skip
+        category = cat_map.get(doi)
 
         if category is None:
             skipped_no_meta += 1
             continue
 
         if category in TARGET_CATEGORIES:
-            collected.append(row)
-            if len(collected) >= 50_000:
+            matched_indices.append(idx)
+            if len(matched_indices) >= 100_000:
                 break
 
-    total_checked = len(collected) + skipped_no_meta + (
-        # rows iterated that weren't in target and weren't skipped
-        sum(1 for _ in [])  # placeholder; tqdm handles display
-    )
-
     print(f"\nSkipped (not in Kaggle snapshot): {skipped_no_meta:,}")
-    print(f"Collected: {len(collected):,}")
+    print(f"Matched: {len(matched_indices):,}")
 
-    result_df = pd.DataFrame(collected)
+    # Free the category map and DOI-only df before loading full data
+    del cat_map, dois
+
+    # --- Pass 2: load full rows only for matched indices ---
+    print("\nPass 2: loading full rows for matched papers...")
+    df_full = pd.read_parquet("./hf_data/")
+    result_df = df_full.loc[matched_indices]
+    del df_full
+
     out_path = "sample_cv.parquet"
     result_df.to_parquet(out_path, index=False)
     print(f"Saved {len(result_df):,} rows to {out_path}")

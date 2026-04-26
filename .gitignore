@@ -2,3 +2,4 @@
 .env
 voids.json
 **/*.parquet
+arxiv-metadata-oai-snapshot.json
