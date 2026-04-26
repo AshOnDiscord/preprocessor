@@ -16,7 +16,7 @@ Pipeline:
   5. Pick top N → void centres
   6. Per void: find K nearest real papers → border papers
   7. Per void: convex hull of border paper coords → shape + area
-  8. Per void: send border titles to LLM → topic name  [currently disabled]
+  8. Per void: send border titles to LLM → topic name
 
 Why Voronoi instead of KDE grid:
   Voronoi vertices are by construction the maximally-empty points — each one
@@ -62,7 +62,7 @@ Output schema per void:
   }
 
 Dependencies:
-  pip install pandas numpy scikit-learn alphashape shapely joblib pyarrow python-dotenv scipy
+  pip install pandas numpy scikit-learn alphashape shapely joblib pyarrow python-dotenv scipy openrouter
   echo "HACKCLUB_KEY=your_key_here" > .env
 """
 
@@ -75,6 +75,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from joblib import Parallel, delayed
+from openrouter import OpenRouter
 from shapely.geometry import MultiPoint, Point
 from sklearn.neighbors import NearestNeighbors
 from scipy.spatial import Voronoi
@@ -100,7 +101,7 @@ ALPHA = 0.05
 DEDUP_RADIUS = 1.0
 
 # Border papers per void
-BORDER_K = 10
+BORDER_K = 20
 
 # Angular coverage filter
 # How many neighbors to use when computing angular spread around each candidate.
@@ -115,17 +116,72 @@ MIN_COVERAGE_DEG = 300  # allows at most a 60° open wedge
 # Parallelism
 N_JOBS = -1
 
-# LLM naming — disabled for now
-DO_LLM_NAMING = False
-LLM_DELAY     = 0.5
+# LLM naming
+DO_LLM_NAMING = True
+LLM_DELAY     = 0.5  # seconds between requests to avoid rate limiting
+
+# ---------------------------------------------------------------------------
+# HackClub / OpenRouter client
+# ---------------------------------------------------------------------------
+HACKCLUB_KEY = os.getenv("HACKCLUB_KEY")
+if DO_LLM_NAMING and not HACKCLUB_KEY:
+    raise EnvironmentError("HACKCLUB_KEY not set — add it to your .env file")
+
+ai_client = OpenRouter(
+    api_key=HACKCLUB_KEY or "dummy",
+    server_url="https://ai.hackclub.com/proxy/v1",
+)
 
 # ---------------------------------------------------------------------------
 # LLM: name a void given its border paper titles
 # ---------------------------------------------------------------------------
+_SYSTEM_PROMPT = (
+    "You are a research cartographer mapping the landscape of scientific literature. "
+    "You will receive a list of paper titles that SURROUND an empty region in a 2D "
+    "semantic embedding space. Your task is to name the research topic that is "
+    "conspicuously ABSENT — the intellectual gap this void represents.\n\n"
+    "Guidelines:\n"
+    "- The border papers are the EDGES of the hole, not the hole itself.\n"
+    "- The void is what would CONNECT or BRIDGE these surrounding topics but doesn't exist yet.\n"
+    "- Be specific. 'Interdisciplinary research' is not a useful answer.\n"
+    "- The name should read like a real research field or open problem (3-8 words).\n\n"
+    "Respond with ONLY valid JSON, no markdown fences:\n"
+    '{"name": "<short noun phrase>", "reasoning": "<1-2 sentences>"}'
+)
+
 def name_void(border_titles: list, void_id: int) -> dict:
     """Call the LLM and return {"name": ..., "reasoning": ...}."""
-    # --- LLM naming disabled: return placeholder ---
-    return {"name": f"Void {void_id}", "reasoning": ""}
+    if not DO_LLM_NAMING:
+        return {"name": f"Void {void_id}", "reasoning": ""}
+
+    try:
+        titles_block = "\n".join(f"- {t}" for t in border_titles)
+        user_msg = (
+            f"These papers surround Void #{void_id} in the embedding space:\n\n"
+            f"{titles_block}\n\n"
+            f"What research topic is conspicuously absent in the gap between them?"
+        )
+        response = ai_client.chat.send(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user",   "content": user_msg},
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+        parsed = json.loads(raw)
+        return {
+            "name":      str(parsed.get("name", f"Void {void_id}")),
+            "reasoning": str(parsed.get("reasoning", "")),
+        }
+    except Exception as e:
+        print(f"  Warning: naming failed for void {void_id}: {e}")
+        return {"name": f"Unnamed Void {void_id}", "reasoning": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +263,6 @@ print(f"  bounding-box diagonal: {bbox_diag:.2f}  (DEDUP_RADIUS={DEDUP_RADIUS})"
 print(f"\nComputing Voronoi diagram for {len(xy):,} points ...")
 t0  = time.time()
 vor = Voronoi(xy)
-# vor.vertices shape: (M, 2) — the candidate void centres
 voronoi_verts = vor.vertices
 print(f"  {len(voronoi_verts):,} Voronoi vertices  ({time.time()-t0:.1f}s)")
 
@@ -242,10 +297,6 @@ if len(candidates) == 0:
 
 # ---------------------------------------------------------------------------
 # Step 3: Score by distance to nearest real paper
-#
-# Each Voronoi vertex is the circumcentre of a Delaunay triangle, so its
-# distance to the nearest data point IS the radius of the largest empty
-# circle centred there. Larger radius = bigger hole = better void candidate.
 # ---------------------------------------------------------------------------
 print(f"\nScoring {len(candidates):,} candidates by empty-circle radius ...")
 t0 = time.time()
@@ -261,15 +312,6 @@ empty_radii = empty_radii[order]
 
 # ---------------------------------------------------------------------------
 # Step 3b: Filter by angular coverage
-#
-# Discard candidates whose ANGULAR_K nearest papers don't surround them on
-# all sides. Edge bays / peninsulas fail this because their neighbors exist
-# on only ~half the circle, leaving a giant open-wedge pointing outward.
-#
-# Tune MIN_COVERAGE_DEG:
-#   300° → strict, at most a 60° open wedge allowed (default, good start)
-#   270° → looser, allows a 90° gap (use if real voids near filaments are lost)
-#   260° → even looser
 # ---------------------------------------------------------------------------
 print(f"\nFiltering by angular coverage "
       f"(k={ANGULAR_K}, min_coverage={MIN_COVERAGE_DEG}°, "
@@ -284,7 +326,7 @@ surrounded_mask = np.array([
     for c, idxs in zip(candidates, angular_idxs)
 ])
 
-n_before = len(candidates)
+n_before    = len(candidates)
 candidates  = candidates[surrounded_mask]
 empty_radii = empty_radii[surrounded_mask]
 print(f"  {surrounded_mask.sum():,} / {n_before:,} candidates passed  ({time.time()-t0:.1f}s)")
@@ -297,10 +339,6 @@ if len(candidates) == 0:
 
 # ---------------------------------------------------------------------------
 # Step 4: Deduplicate — greedy suppression within DEDUP_RADIUS
-#
-# Walk the ranked list; accept a candidate only if it is farther than
-# DEDUP_RADIUS from every already-accepted void. This prevents N voids
-# from all piling into the single largest hole.
 # ---------------------------------------------------------------------------
 print(f"\nDeduplicating (DEDUP_RADIUS={DEDUP_RADIUS}) ...")
 accepted_centres = []
@@ -332,9 +370,9 @@ _, border_indices = paper_nbrs.kneighbors(void_centres)
 print(f"  Done in {time.time()-t0:.1f}s")
 
 # ---------------------------------------------------------------------------
-# Steps 6 & 7: Shape + naming, assemble output
+# Steps 6, 7 & 8: Shape + LLM naming, assemble output
 # ---------------------------------------------------------------------------
-print(f"\nComputing shapes + skipping LLM naming (DO_LLM_NAMING=False) ...")
+print(f"\nComputing shapes + {'LLM naming' if DO_LLM_NAMING else 'skipping LLM naming'} ...")
 
 voids_output = []
 
@@ -361,8 +399,11 @@ for rank, (centre, radius, b_idxs) in enumerate(
     # --- void shape ---
     shape_dict, shape_area = compute_void_shape(np.array(border_xy))
 
-    # --- naming ---
+    # --- LLM naming ---
+    print(f"  Naming void {rank+1}/{len(void_centres)} ...")
     naming = name_void(border_titles, rank)
+    if DO_LLM_NAMING and rank < len(void_centres) - 1:
+        time.sleep(LLM_DELAY)
 
     voids_output.append({
         "void_id":        rank,
@@ -395,6 +436,7 @@ for v in voids_output[:5]:
           f"empty_radius={v['empty_radius']:.4f}  "
           f"area={v['shape_area']:.4f}  "
           f"hull_verts={verts}")
+    print(f"       reasoning: {v['name_reasoning'][:120]}")
     for p in v["border_papers"][:3]:
         print(f"         → {p['title'][:72]}")
 
